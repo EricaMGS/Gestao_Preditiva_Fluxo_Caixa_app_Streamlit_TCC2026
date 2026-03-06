@@ -1,0 +1,26 @@
+==================================================
+📊 RELATÓRIO DE MÉTRICAS DO MODELO
+==================================================
+
+Arquivo analisado: C:\Users\Acer\Desktop\fluxo_caixa_os\Gestao_Preditiva_Fluxo_Caixa_app_Streamlit_TCC2026\fluxo_caixa_estimado_20260305_2101.xlsx
+Melhor modelo: Lasso
+
+Métricas de Treino:
+  RMSE: R$ 200.38
+  R²:   0.0071
+  MAPE: 166.48%
+
+Métricas de Teste:
+  RMSE: R$ 183.63
+  R²:   -0.0066
+  MAPE: 178.29%
+
+Métricas de Validação:
+  RMSE: R$ 285.54
+  MAE:  R$ 136.27
+  R²:   -0.0109
+  MAPE: 132.46%
+
+Previsão para o próximo ano:
+  Total: R$ 9,557,686.45
+  Média mensal: R$ 796,473.87
