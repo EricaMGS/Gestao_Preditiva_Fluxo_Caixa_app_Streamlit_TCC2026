@@ -1,6 +1,6 @@
 # ============================================
-# MODELO DE PREVISÃO DE RECEITAS - VERSÃO CORRIGIDA
-# Corrigido: problema de features e overfitting
+# MODELO DE PREVISÃO DE RECEITAS E DESPESAS - VERSÃO CORRIGIDA
+# Correção: tratamento de tipos de dados e conversão para inteiros
 # ============================================
 
 import pandas as pd
@@ -14,19 +14,12 @@ warnings.filterwarnings('ignore')
 # Modelos de Machine Learning
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from xgboost import XGBRegressor
 
 # Pré-processamento e métricas
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.metrics import (
-    mean_absolute_error, 
-    mean_squared_error, 
-    r2_score,
-    mean_absolute_percentage_error
-)
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
 
-# Para salvar o modelo
+# Para salvar os modelos
 import joblib
 import os
 
@@ -35,16 +28,13 @@ plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
 
 print("=" * 60)
-print("📊 MODELO DE PREVISÃO DE RECEITAS - VERSÃO CORRIGIDA")
+print("📊 MODELO DE PREVISÃO DE RECEITAS E DESPESAS - VERSÃO CORRIGIDA")
 print("=" * 60)
 
-# ============================================
-# PASSO 1: CARREGAR E PREPARAR OS DADOS
-# ============================================
 
-def carregar_dados(caminho_arquivo):
+def carregar_dados_completos(caminho_arquivo):
     """
-    Carrega e prepara os dados para modelagem
+    Carrega e prepara os dados separando receitas e despesas
     """
     print("\n📂 Carregando dados...")
     
@@ -58,29 +48,44 @@ def carregar_dados(caminho_arquivo):
     # Converter valores
     df['Valor'] = pd.to_numeric(df['Valor (R$)'], errors='coerce')
     
-    # Filtrar apenas receitas (valores positivos)
-    df_receitas = df[df['Valor'] > 0].copy()
-    print(f"   💰 Total de receitas: {len(df_receitas)}")
+    # Remover linhas com SALDO TOTAL DISPONÍVEL DIA (não são transações reais)
+    df = df[~df['Lançamento'].str.contains('SALDO TOTAL DISPONÍVEL DIA', na=False)].copy()
     
     # Remover valores nulos
-    df_receitas = df_receitas.dropna(subset=['Data', 'Valor'])
+    df = df.dropna(subset=['Data', 'Valor'])
     
-    return df_receitas
+    # Separar receitas (valores positivos) e despesas (valores negativos)
+    df_receitas = df[df['Valor'] > 0].copy()
+    df_despesas = df[df['Valor'] < 0].copy()
+    
+    # Para despesas, converter para valores positivos (facilita análise)
+    df_despesas['Valor'] = df_despesas['Valor'].abs()
+    
+    print(f"\n   💰 Receitas: {len(df_receitas)} registros, Total: R$ {df_receitas['Valor'].sum():,.2f}")
+    print(f"   📉 Despesas: {len(df_despesas)} registros, Total: R$ {df_despesas['Valor'].sum():,.2f}")
+    print(f"   📈 Saldo: R$ {(df_receitas['Valor'].sum() - df_despesas['Valor'].sum()):,.2f}")
+    
+    return df_receitas, df_despesas
 
-def criar_features(df):
+
+def criar_features_diarias(df, nome):
     """
-    Cria features temporais para o modelo (SEM LAGS para evitar data leakage)
+    Cria features temporais para modelagem diária
     """
-    print("\n🔄 Criando features temporais...")
+    print(f"\n🔄 Criando features diárias para {nome}...")
+    
+    if len(df) == 0:
+        print(f"   ⚠️ Nenhum dado encontrado para {nome}!")
+        return pd.DataFrame()
     
     df = df.copy()
     
     # Features temporais básicas
-    df['ano'] = df['Data'].dt.year
-    df['mes'] = df['Data'].dt.month
-    df['dia'] = df['Data'].dt.day
-    df['dia_semana'] = df['Data'].dt.dayofweek
-    df['trimestre'] = df['Data'].dt.quarter
+    df['ano'] = df['Data'].dt.year.astype(int)
+    df['mes'] = df['Data'].dt.month.astype(int)
+    df['dia'] = df['Data'].dt.day.astype(int)
+    df['dia_semana'] = df['Data'].dt.dayofweek.astype(int)
+    df['trimestre'] = df['Data'].dt.quarter.astype(int)
     
     # Features cíclicas (para capturar sazonalidade)
     df['mes_sin'] = np.sin(2 * np.pi * df['mes'] / 12)
@@ -111,33 +116,58 @@ def criar_features(df):
     }).reset_index()
     
     # Aplainar colunas
-    df_diario.columns = ['Data', 'receita_total', 'num_transacoes', 'receita_media', 
-                        'ano', 'mes', 'dia', 'dia_semana', 'trimestre',
-                        'mes_sin', 'mes_cos', 'dia_semana_sin', 
-                        'dia_semana_cos', 'fim_semana', 'dia_proporcao']
+    df_diario.columns = ['Data', f'{nome}_total', f'{nome}_num_transacoes', f'{nome}_media',
+                         'ano', 'mes', 'dia', 'dia_semana', 'trimestre',
+                         'mes_sin', 'mes_cos', 'dia_semana_sin',
+                         'dia_semana_cos', 'fim_semana', 'dia_proporcao']
     
-    print(f"   ✅ Features criadas: {df_diario.shape[1]} colunas")
-    print(f"   📅 Período: {df_diario['Data'].min().date()} a {df_diario['Data'].max().date()}")
+    # Garantir que as colunas são inteiros
+    for col in ['ano', 'mes', 'dia', 'dia_semana', 'trimestre', 'fim_semana']:
+        if col in df_diario.columns:
+            df_diario[col] = df_diario[col].fillna(0).astype(int)
+    
+    # Preencher dias sem transações com 0
+    datas_completas = pd.date_range(start=df_diario['Data'].min(), 
+                                    end=df_diario['Data'].max(), 
+                                    freq='D')
+    df_diario = df_diario.set_index('Data').reindex(datas_completas).reset_index()
+    df_diario.rename(columns={'index': 'Data'}, inplace=True)
+    df_diario[f'{nome}_total'] = df_diario[f'{nome}_total'].fillna(0)
+    df_diario[f'{nome}_num_transacoes'] = df_diario[f'{nome}_num_transacoes'].fillna(0)
+    df_diario[f'{nome}_media'] = df_diario[f'{nome}_media'].fillna(0)
+    
+    # Preencher features temporais para os dias sem dados
+    for col in ['ano', 'mes', 'dia', 'dia_semana', 'trimestre', 'mes_sin', 'mes_cos',
+                'dia_semana_sin', 'dia_semana_cos', 'fim_semana', 'dia_proporcao']:
+        if col in df_diario.columns:
+            df_diario[col] = df_diario[col].fillna(method='ffill').fillna(method='bfill')
+    
+    # Converter novamente para inteiros
+    for col in ['ano', 'mes', 'dia', 'dia_semana', 'trimestre', 'fim_semana']:
+        if col in df_diario.columns:
+            df_diario[col] = df_diario[col].astype(int)
+    
+    print(f"   ✅ Período: {df_diario['Data'].min().date()} a {df_diario['Data'].max().date()}")
     print(f"   📊 Total de dias: {len(df_diario)}")
+    print(f"   📈 {nome} total: R$ {df_diario[f'{nome}_total'].sum():,.2f}")
     
     return df_diario
 
-# ============================================
-# PASSO 2: DIVISÃO DOS DADOS
-# ============================================
 
-def dividir_dados_temporais(df, target_col='receita_total'):
+def dividir_dados_temporais(df, target_col, nome):
     """
     Divide os dados respeitando a ordem temporal
     70% treino, 20% teste, 10% validação
     """
-    print("\n🔄 Dividindo dados temporais...")
-    print("   📊 70% Treino | 20% Teste | 10% Validação")
+    print(f"\n🔄 Dividindo dados temporais para {nome}...")
+    
+    if len(df) == 0:
+        return None, None, None, None, None, None, None, None, None, None
     
     # Features (X) e Target (y)
-    feature_cols = ['ano', 'mes', 'dia', 'dia_semana', 'trimestre', 
-                   'mes_sin', 'mes_cos', 'dia_semana_sin', 'dia_semana_cos', 
-                   'fim_semana', 'dia_proporcao']
+    feature_cols = ['ano', 'mes', 'dia', 'dia_semana', 'trimestre',
+                    'mes_sin', 'mes_cos', 'dia_semana_sin', 'dia_semana_cos',
+                    'fim_semana', 'dia_proporcao']
     
     X = df[feature_cols]
     y = df[target_col]
@@ -169,21 +199,18 @@ def dividir_dados_temporais(df, target_col='receita_total'):
     
     return X_train, X_test, X_val, y_train, y_test, y_val, datas_train, datas_test, datas_val, feature_cols
 
-# ============================================
-# PASSO 3: TREINAR MODELOS (COM REGULARIZAÇÃO)
-# ============================================
 
-def treinar_modelos(X_train, y_train, X_test, y_test):
+def treinar_modelo(X_train, y_train, X_test, y_test, nome):
     """
-    Treina diferentes modelos com regularização para evitar overfitting
+    Treina modelos e retorna o melhor
     """
-    print("\n🤖 Treinando múltiplos modelos com regularização...")
+    print(f"\n🤖 Treinando modelo para {nome}...")
     
-    # Definição dos modelos com parâmetros mais robustos
+    # Definição dos modelos com parâmetros robustos
     modelos = {
         'Random Forest': RandomForestRegressor(
             n_estimators=100,
-            max_depth=8,  # Reduzido para evitar overfitting
+            max_depth=8,
             min_samples_split=10,
             min_samples_leaf=5,
             random_state=42,
@@ -193,166 +220,68 @@ def treinar_modelos(X_train, y_train, X_test, y_test):
             n_estimators=100,
             learning_rate=0.05,
             max_depth=4,
-            subsample=0.8,  # Usar apenas 80% dos dados em cada árvore
+            subsample=0.8,
             random_state=42
         ),
-        'XGBoost': XGBRegressor(
-            n_estimators=100,
-            learning_rate=0.05,
-            max_depth=4,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,  # Regularização L1
-            reg_lambda=1.0,  # Regularização L2
-            random_state=42,
-            verbosity=0
-        ),
-        'Ridge': Ridge(alpha=10.0),  # Regularização L2 forte
-        'Lasso': Lasso(alpha=1.0, max_iter=10000)  # Regularização L1
+        'Ridge': Ridge(alpha=10.0),
+        'Lasso': Lasso(alpha=1.0, max_iter=10000)
     }
     
     resultados = {}
-    melhores_modelos = {}
     
-    for nome, modelo in modelos.items():
-        print(f"\n   📈 Treinando {nome}...")
-        
+    for nome_modelo, modelo in modelos.items():
         # Treinar
         modelo.fit(X_train, y_train)
         
         # Prever
-        y_pred_train = modelo.predict(X_train)
         y_pred_test = modelo.predict(X_test)
         
         # Métricas
-        resultados[nome] = {
+        rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test))
+        r2_test = r2_score(y_test, y_pred_test)
+        
+        resultados[nome_modelo] = {
             'modelo': modelo,
-            'train_rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
-            'test_rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
-            'train_r2': r2_score(y_train, y_pred_train),
-            'test_r2': r2_score(y_test, y_pred_test),
-            'train_mape': mean_absolute_percentage_error(y_train, y_pred_train) * 100,
-            'test_mape': mean_absolute_percentage_error(y_test, y_pred_test) * 100
+            'rmse_test': rmse_test,
+            'r2_test': r2_test
         }
         
-        print(f"      ✅ RMSE Treino: R$ {resultados[nome]['train_rmse']:.2f}")
-        print(f"      ✅ RMSE Teste:  R$ {resultados[nome]['test_rmse']:.2f}")
-        print(f"      ✅ R² Teste:     {resultados[nome]['test_r2']:.4f}")
+        print(f"   📈 {nome_modelo}: RMSE=R$ {rmse_test:.2f}, R²={r2_test:.4f}")
     
-    # Selecionar melhor modelo (baseado no RMSE de teste)
-    melhor_modelo_nome = min(resultados, key=lambda x: resultados[x]['test_rmse'])
-    melhor_modelo = resultados[melhor_modelo_nome]['modelo']
+    # Selecionar melhor modelo (baseado no RMSE)
+    melhor_nome = min(resultados, key=lambda x: resultados[x]['rmse_test'])
+    melhor_modelo = resultados[melhor_nome]['modelo']
     
-    print(f"\n🏆 Melhor modelo: {melhor_modelo_nome}")
-    print(f"   RMSE Teste: R$ {resultados[melhor_modelo_nome]['test_rmse']:.2f}")
-    print(f"   R² Teste: {resultados[melhor_modelo_nome]['test_r2']:.4f}")
+    print(f"\n🏆 Melhor modelo para {nome}: {melhor_nome}")
+    print(f"   RMSE Teste: R$ {resultados[melhor_nome]['rmse_test']:.2f}")
+    print(f"   R² Teste: {resultados[melhor_nome]['r2_test']:.4f}")
     
-    return melhor_modelo, melhor_modelo_nome, resultados
+    return melhor_modelo, melhor_nome, resultados
 
-# ============================================
-# PASSO 4: VALIDAÇÃO FINAL
-# ============================================
 
-def validar_modelo(modelo, X_val, y_val, datas_val):
+def prever_proximos_meses(modelo, df_original, feature_cols, meses=12):
     """
-    Valida o modelo no conjunto de validação
+    Faz previsões para os próximos meses - VERSÃO CORRIGIDA
     """
-    print("\n🔍 Validando modelo no conjunto de validação...")
-    
-    # Previsões
-    y_pred_val = modelo.predict(X_val)
-    
-    # Métricas
-    rmse_val = np.sqrt(mean_squared_error(y_val, y_pred_val))
-    mae_val = mean_absolute_error(y_val, y_pred_val)
-    r2_val = r2_score(y_val, y_pred_val)
-    mape_val = mean_absolute_percentage_error(y_val, y_pred_val) * 100
-    
-    print(f"\n   📊 Métricas de Validação:")
-    print(f"      RMSE:  R$ {rmse_val:.2f}")
-    print(f"      MAE:   R$ {mae_val:.2f}")
-    print(f"      R²:    {r2_val:.4f}")
-    print(f"      MAPE:  {mape_val:.2f}%")
-    
-    # Plotar comparação
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # 1. Série temporal
-    ax1 = axes[0, 0]
-    ax1.plot(datas_val, y_val, 'b-', label='Real', linewidth=2)
-    ax1.plot(datas_val, y_pred_val, 'r--', label='Previsto', linewidth=2)
-    ax1.set_title('Previsão vs Real - Validação', fontsize=12, fontweight='bold')
-    ax1.set_xlabel('Data')
-    ax1.set_ylabel('Receita (R$)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # 2. Dispersão
-    ax2 = axes[0, 1]
-    ax2.scatter(y_val, y_pred_val, alpha=0.6)
-    ax2.plot([y_val.min(), y_val.max()], [y_val.min(), y_val.max()], 'r--', lw=2)
-    ax2.set_title('Valores Reais vs Previstos', fontsize=12, fontweight='bold')
-    ax2.set_xlabel('Real (R$)')
-    ax2.set_ylabel('Previsto (R$)')
-    ax2.grid(True, alpha=0.3)
-    
-    # 3. Resíduos
-    ax3 = axes[1, 0]
-    residuos = y_val - y_pred_val
-    ax3.scatter(y_pred_val, residuos, alpha=0.6)
-    ax3.axhline(y=0, color='r', linestyle='--')
-    ax3.set_title('Resíduos vs Valores Previstos', fontsize=12, fontweight='bold')
-    ax3.set_xlabel('Previsto (R$)')
-    ax3.set_ylabel('Resíduo (R$)')
-    ax3.grid(True, alpha=0.3)
-    
-    # 4. Distribuição dos erros
-    ax4 = axes[1, 1]
-    ax4.hist(residuos, bins=20, edgecolor='black', alpha=0.7)
-    ax4.axvline(x=0, color='r', linestyle='--')
-    ax4.set_title('Distribuição dos Resíduos', fontsize=12, fontweight='bold')
-    ax4.set_xlabel('Resíduo (R$)')
-    ax4.set_ylabel('Frequência')
-    ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('validacao_modelo.png', dpi=100, bbox_inches='tight')
-    plt.show()
-    
-    return {
-        'rmse': rmse_val,
-        'mae': mae_val,
-        'r2': r2_val,
-        'mape': mape_val,
-        'residuos': residuos
-    }
-
-# ============================================
-# PASSO 5: PREVER PRÓXIMO ANO (CORRIGIDO)
-# ============================================
-
-def prever_proximo_ano(modelo, df_original, feature_cols, anos=1):
-    """
-    Faz previsões para o próximo ano (VERSÃO CORRIGIDA)
-    """
-    print(f"\n🔮 Prevendo receitas para os próximos {anos} ano(s)...")
+    print(f"\n🔮 Prevendo para os próximos {meses} meses...")
     
     ultima_data = df_original['Data'].max()
+    dias_prever = meses * 30  # Aproximação
+    
     datas_futuras = pd.date_range(
         start=ultima_data + timedelta(days=1),
-        periods=365 * anos,
+        periods=dias_prever,
         freq='D'
     )
     
-    # Criar DataFrame futuro com as features corretas
+    # Criar DataFrame futuro com as features
     df_futuro = pd.DataFrame({'Data': datas_futuras})
     
-    # Criar TODAS as features que o modelo espera
-    df_futuro['ano'] = df_futuro['Data'].dt.year
-    df_futuro['mes'] = df_futuro['Data'].dt.month
-    df_futuro['dia'] = df_futuro['Data'].dt.day
-    df_futuro['dia_semana'] = df_futuro['Data'].dt.dayofweek
-    df_futuro['trimestre'] = df_futuro['Data'].dt.quarter
+    df_futuro['ano'] = df_futuro['Data'].dt.year.astype(int)
+    df_futuro['mes'] = df_futuro['Data'].dt.month.astype(int)
+    df_futuro['dia'] = df_futuro['Data'].dt.day.astype(int)
+    df_futuro['dia_semana'] = df_futuro['Data'].dt.dayofweek.astype(int)
+    df_futuro['trimestre'] = df_futuro['Data'].dt.quarter.astype(int)
     
     # Features cíclicas
     df_futuro['mes_sin'] = np.sin(2 * np.pi * df_futuro['mes'] / 12)
@@ -360,83 +289,180 @@ def prever_proximo_ano(modelo, df_original, feature_cols, anos=1):
     df_futuro['dia_semana_sin'] = np.sin(2 * np.pi * df_futuro['dia_semana'] / 7)
     df_futuro['dia_semana_cos'] = np.cos(2 * np.pi * df_futuro['dia_semana'] / 7)
     
-    # Fim de semana
     df_futuro['fim_semana'] = df_futuro['dia_semana'].isin([5, 6]).astype(int)
-    
-    # Dia proporção
     df_futuro['dia_proporcao'] = df_futuro['dia'] / 31
     
-    # Selecionar apenas as features usadas no treinamento
     X_futuro = df_futuro[feature_cols]
     
     # Prever
     previsoes = modelo.predict(X_futuro)
-    previsoes = np.maximum(previsoes, 0)  # Garantir valores não negativos
+    previsoes = np.maximum(previsoes, 0)
     
-    # Criar DataFrame de previsões
     df_previsoes = pd.DataFrame({
         'Data': datas_futuras,
-        'Receita_Prevista': previsoes,
-        'Receita_Acumulada': np.cumsum(previsoes)
+        'Valor_Previsto': previsoes
     })
     
-    # Adicionar colunas para análise
-    df_previsoes['mes'] = df_previsoes['Data'].dt.month
+    # Agrupar por mês
     df_previsoes['ano'] = df_previsoes['Data'].dt.year
-    df_previsoes['dia_semana'] = df_previsoes['Data'].dt.dayofweek
+    df_previsoes['mes'] = df_previsoes['Data'].dt.month
     
-    # Resumo mensal
     resumo_mensal = df_previsoes.groupby(['ano', 'mes']).agg({
-        'Receita_Prevista': ['sum', 'mean', 'count', 'std']
-    }).round(2)
-    resumo_mensal.columns = ['Total_Mensal', 'Media_Diaria', 'Dias', 'Desvio_Padrao']
+        'Valor_Previsto': 'sum'
+    }).round(2).reset_index()
+    resumo_mensal.columns = ['Ano', 'Mês', 'Total_Previsto']
+    
+    # CORREÇÃO: Converter para inteiros antes de formatar
+    resumo_mensal['Ano'] = resumo_mensal['Ano'].astype(int)
+    resumo_mensal['Mês'] = resumo_mensal['Mês'].astype(int)
+    
+    # Criar nome do mês com formatação segura
+    resumo_mensal['Mês_Nome'] = resumo_mensal.apply(
+        lambda x: f"{int(x['Mês']):02d}/{int(x['Ano'])}", axis=1
+    )
     
     print(f"\n   📈 Resumo das previsões:")
-    print(f"      Total previsto: R$ {df_previsoes['Receita_Prevista'].sum():,.2f}")
-    print(f"      Média diária: R$ {df_previsoes['Receita_Prevista'].mean():.2f}")
-    print(f"      Maior dia: R$ {df_previsoes['Receita_Prevista'].max():.2f}")
+    print(f"      Total previsto: R$ {df_previsoes['Valor_Previsto'].sum():,.2f}")
+    print(f"      Média mensal: R$ {resumo_mensal['Total_Previsto'].mean():,.2f}")
+    print(f"      Mês com maior previsão: {resumo_mensal.loc[resumo_mensal['Total_Previsto'].idxmax(), 'Mês_Nome']} - R$ {resumo_mensal['Total_Previsto'].max():,.2f}")
     
     return df_previsoes, resumo_mensal
 
-# ============================================
-# PASSO 6: ANÁLISE DE FEATURES IMPORTANTES
-# ============================================
 
-def analisar_importancia_features(modelo, feature_cols, nome_modelo):
+def plotar_resultados(df_historico_receitas, df_historico_despesas, 
+                      df_previsao_receitas, df_previsao_despesas,
+                      resumo_mensal_receitas, resumo_mensal_despesas):
     """
-    Analisa quais features são mais importantes para o modelo
+    Plota gráficos comparativos
     """
-    print("\n📊 Analisando importância das features...")
+    # Verificar se os dados existem
+    if len(df_historico_receitas) == 0 or len(df_historico_despesas) == 0:
+        print("⚠️ Dados insuficientes para gerar gráficos")
+        return None
     
-    if hasattr(modelo, 'feature_importances_'):
-        importancias = modelo.feature_importances_
-        indices = np.argsort(importancias)[::-1]
-        
-        print("\n   Top 5 features mais importantes:")
-        for i in range(min(5, len(feature_cols))):
-            print(f"      {i+1}. {feature_cols[indices[i]]}: {importancias[indices[i]]:.3f}")
-        
-        # Plotar
-        plt.figure(figsize=(10, 6))
-        plt.title(f'Importância das Features - {nome_modelo}')
-        plt.barh(range(len(importancias)), importancias[indices])
-        plt.yticks(range(len(importancias)), [feature_cols[i] for i in indices])
-        plt.xlabel('Importância')
-        plt.tight_layout()
-        plt.savefig('importancia_features.png', dpi=100, bbox_inches='tight')
-        plt.show()
-    else:
-        print("   Modelo não suporta análise de importância de features")
+    fig, axes = plt.subplots(3, 2, figsize=(16, 14))
+    
+    # 1. Série histórica e previsão - Receitas
+    ax1 = axes[0, 0]
+    ax1.plot(df_historico_receitas['Data'], df_historico_receitas['receita_total'], 
+             'b-', label='Histórico', linewidth=1.5, alpha=0.7)
+    if len(df_previsao_receitas) > 0:
+        ax1.plot(df_previsao_receitas['Data'], df_previsao_receitas['Valor_Previsto'], 
+                 'r--', label='Previsão', linewidth=2)
+    ax1.axvline(x=df_historico_receitas['Data'].max(), color='green', 
+                linestyle=':', label='Hoje')
+    ax1.set_title('Previsão de Receitas - Próximos 12 Meses', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Data')
+    ax1.set_ylabel('Receita Diária (R$)')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Série histórica e previsão - Despesas
+    ax2 = axes[0, 1]
+    ax2.plot(df_historico_despesas['Data'], df_historico_despesas['despesa_total'], 
+             'b-', label='Histórico', linewidth=1.5, alpha=0.7)
+    if len(df_previsao_despesas) > 0:
+        ax2.plot(df_previsao_despesas['Data'], df_previsao_despesas['Valor_Previsto'], 
+                 'r--', label='Previsão', linewidth=2)
+    ax2.axvline(x=df_historico_despesas['Data'].max(), color='green', 
+                linestyle=':', label='Hoje')
+    ax2.set_title('Previsão de Despesas - Próximos 12 Meses', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Data')
+    ax2.set_ylabel('Despesa Diária (R$)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. Comparativo mensal - Barras
+    ax3 = axes[1, 0]
+    meses = resumo_mensal_receitas['Mês_Nome'].tolist()
+    x = np.arange(len(meses))
+    width = 0.35
+    
+    bars1 = ax3.bar(x - width/2, resumo_mensal_receitas['Total_Previsto'], 
+                    width, label='Receitas', color='green', alpha=0.7)
+    bars2 = ax3.bar(x + width/2, resumo_mensal_despesas['Total_Previsto'], 
+                    width, label='Despesas', color='red', alpha=0.7)
+    
+    ax3.set_title('Previsão Mensal - Receitas vs Despesas', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Mês')
+    ax3.set_ylabel('Valor (R$)')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(meses, rotation=45, ha='right')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # 4. Saldo mensal previsto
+    ax4 = axes[1, 1]
+    saldo_mensal = (resumo_mensal_receitas['Total_Previsto'].values - 
+                    resumo_mensal_despesas['Total_Previsto'].values)
+    
+    colors = ['green' if s >= 0 else 'red' for s in saldo_mensal]
+    ax4.bar(meses, saldo_mensal, color=colors, alpha=0.7)
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax4.set_title('Saldo Mensal Previsto', fontsize=12, fontweight='bold')
+    ax4.set_xlabel('Mês')
+    ax4.set_ylabel('Saldo (R$)')
+    ax4.set_xticklabels(meses, rotation=45, ha='right')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # 5. Saldo acumulado previsto
+    ax5 = axes[2, 0]
+    saldo_acumulado = np.cumsum(saldo_mensal)
+    ax5.fill_between(range(len(meses)), 0, saldo_acumulado, alpha=0.3, color='blue')
+    ax5.plot(range(len(meses)), saldo_acumulado, 'b-', linewidth=2)
+    ax5.set_title('Saldo Acumulado Previsto', fontsize=12, fontweight='bold')
+    ax5.set_xlabel('Mês')
+    ax5.set_ylabel('Saldo Acumulado (R$)')
+    ax5.set_xticks(range(len(meses)))
+    ax5.set_xticklabels(meses, rotation=45, ha='right')
+    ax5.grid(True, alpha=0.3)
+    
+    # 6. Resumo métricas
+    ax6 = axes[2, 1]
+    ax6.axis('off')
+    
+    total_receitas = resumo_mensal_receitas['Total_Previsto'].sum()
+    total_despesas = resumo_mensal_despesas['Total_Previsto'].sum()
+    saldo_total = total_receitas - total_despesas
+    
+    # Encontrar melhor mês
+    melhor_mes_idx = np.argmax(saldo_mensal)
+    melhor_mes = meses[melhor_mes_idx] if melhor_mes_idx < len(meses) else "N/A"
+    
+    texto_resumo = f"""
+    📊 RESUMO DAS PREVISÕES (12 MESES)
+    {'='*40}
+    
+    RECEITAS TOTAIS:     R$ {total_receitas:,.2f}
+    DESPESAS TOTAIS:     R$ {total_despesas:,.2f}
+    {'-'*40}
+    SALDO TOTAL:         R$ {saldo_total:,.2f}
+    
+    {'='*40}
+    
+    📈 MÉDIA MENSAL:
+    Receitas:  R$ {total_receitas/12:,.2f}
+    Despesas:  R$ {total_despesas/12:,.2f}
+    
+    💰 MELHOR MÊS (Receitas):
+    {resumo_mensal_receitas.loc[resumo_mensal_receitas['Total_Previsto'].idxmax(), 'Mês_Nome']} - R$ {resumo_mensal_receitas['Total_Previsto'].max():,.2f}
+    
+    📉 MELHOR MÊS (Saldo):
+    {melhor_mes} - R$ {saldo_mensal.max():,.2f}
+    """
+    
+    ax6.text(0.1, 0.9, texto_resumo, transform=ax6.transAxes, fontsize=10,
+             verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    return fig
 
-# ============================================
-# PASSO 7: EXECUÇÃO PRINCIPAL
-# ============================================
 
 def main():
     """
-    Função principal do pipeline
+    Função principal
     """
-    
     # Caminho do arquivo
     pasta = r"C:\Users\Acer\Desktop\fluxo_caixa_os\Gestao_Preditiva_Fluxo_Caixa_app_Streamlit_TCC2026"
     
@@ -453,11 +479,9 @@ def main():
     escolha = input("\n📌 Escolha o número do arquivo (ou digite o nome completo): ").strip()
     
     try:
-        # Se for número
         idx = int(escolha) - 1
         arquivo = arquivos[idx]
     except:
-        # Se for nome
         arquivo = escolha
     
     caminho_completo = os.path.join(pasta, arquivo)
@@ -467,113 +491,182 @@ def main():
         return
     
     # 1. Carregar dados
-    df_receitas = carregar_dados(caminho_completo)
+    df_receitas_raw, df_despesas_raw = carregar_dados_completos(caminho_completo)
     
-    # 2. Criar features
-    df_diario = criar_features(df_receitas)
+    # 2. Criar features diárias
+    df_diario_receitas = criar_features_diarias(df_receitas_raw, 'receita')
+    df_diario_despesas = criar_features_diarias(df_despesas_raw, 'despesa')
     
-    # 3. Dividir dados
-    X_train, X_test, X_val, y_train, y_test, y_val, datas_train, datas_test, datas_val, feature_cols = dividir_dados_temporais(df_diario)
+    if len(df_diario_receitas) == 0:
+        print("❌ Erro: Não foi possível criar dados diários de receitas!")
+        return
     
-    # 4. Escalar features (opcional, mas ajuda modelos lineares)
-    scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    X_val_scaled = scaler.transform(X_val)
+    if len(df_diario_despesas) == 0:
+        print("❌ Erro: Não foi possível criar dados diários de despesas!")
+        return
     
-    # 5. Treinar modelos
-    melhor_modelo, nome_melhor, resultados = treinar_modelos(
-        X_train_scaled, y_train, 
-        X_test_scaled, y_test
-    )
+    # 3. Dividir dados e treinar modelo de RECEITAS
+    print("\n" + "=" * 60)
+    print("📈 TREINANDO MODELO DE RECEITAS")
+    print("=" * 60)
     
-    # 6. Validar no conjunto de validação
-    metricas_val = validar_modelo(melhor_modelo, X_val_scaled, y_val, datas_val)
+    X_train_rec, X_test_rec, X_val_rec, y_train_rec, y_test_rec, y_val_rec, \
+    datas_train_rec, datas_test_rec, datas_val_rec, feature_cols_rec = dividir_dados_temporais(
+        df_diario_receitas, 'receita_total', 'RECEITAS')
     
-    # 7. Analisar importância das features (se aplicável)
-    analisar_importancia_features(melhor_modelo, feature_cols, nome_melhor)
+    if X_train_rec is not None:
+        scaler_rec = RobustScaler()
+        X_train_scaled = scaler_rec.fit_transform(X_train_rec)
+        X_test_scaled = scaler_rec.transform(X_test_rec)
+        
+        modelo_receitas, nome_rec, resultados_rec = treinar_modelo(
+            X_train_scaled, y_train_rec, X_test_scaled, y_test_rec, 'RECEITAS')
+    else:
+        print("❌ Erro ao preparar dados de receitas!")
+        return
     
-    # 8. Prever próximo ano
-    df_previsoes, resumo_mensal = prever_proximo_ano(melhor_modelo, df_diario, feature_cols)
+    # 4. Dividir dados e treinar modelo de DESPESAS
+    print("\n" + "=" * 60)
+    print("📉 TREINANDO MODELO DE DESPESAS")
+    print("=" * 60)
     
-    # 9. Salvar resultados
-    print("\n💾 Salvando resultados...")
+    X_train_desp, X_test_desp, X_val_desp, y_train_desp, y_test_desp, y_val_desp, \
+    datas_train_desp, datas_test_desp, datas_val_desp, feature_cols_desp = dividir_dados_temporais(
+        df_diario_despesas, 'despesa_total', 'DESPESAS')
     
-    # Salvar modelo e scaler
-    joblib.dump(melhor_modelo, os.path.join(pasta, 'modelo_previsao_receitas.pkl'))
-    joblib.dump(scaler, os.path.join(pasta, 'scaler.pkl'))
+    if X_train_desp is not None:
+        scaler_desp = RobustScaler()
+        X_train_scaled_desp = scaler_desp.fit_transform(X_train_desp)
+        X_test_scaled_desp = scaler_desp.transform(X_test_desp)
+        
+        modelo_despesas, nome_desp, resultados_desp = treinar_modelo(
+            X_train_scaled_desp, y_train_desp, X_test_scaled_desp, y_test_desp, 'DESPESAS')
+    else:
+        print("❌ Erro ao preparar dados de despesas!")
+        return
     
-    # Salvar previsões
+    # 5. Fazer previsões para os próximos 12 meses
+    print("\n" + "=" * 60)
+    print("🔮 GERANDO PREVISÕES")
+    print("=" * 60)
+    
+    # Previsão de receitas
+    df_previsao_receitas, resumo_mensal_receitas = prever_proximos_meses(
+        modelo_receitas, df_diario_receitas, feature_cols_rec, meses=12)
+    
+    # Previsão de despesas
+    df_previsao_despesas, resumo_mensal_despesas = prever_proximos_meses(
+        modelo_despesas, df_diario_despesas, feature_cols_desp, meses=12)
+    
+    # 6. Salvar modelos e scalers
+    print("\n💾 Salvando modelos...")
+    
+    joblib.dump(modelo_receitas, os.path.join(pasta, 'modelo_previsao_receitas.pkl'))
+    joblib.dump(scaler_rec, os.path.join(pasta, 'scaler_receitas.pkl'))
+    joblib.dump(modelo_despesas, os.path.join(pasta, 'modelo_previsao_despesas.pkl'))
+    joblib.dump(scaler_desp, os.path.join(pasta, 'scaler_despesas.pkl'))
+    
+    # Salvar features utilizadas
+    joblib.dump(feature_cols_rec, os.path.join(pasta, 'feature_cols_receitas.pkl'))
+    joblib.dump(feature_cols_desp, os.path.join(pasta, 'feature_cols_despesas.pkl'))
+    
+    print(f"   ✅ modelo_previsao_receitas.pkl")
+    print(f"   ✅ scaler_receitas.pkl")
+    print(f"   ✅ modelo_previsao_despesas.pkl")
+    print(f"   ✅ scaler_despesas.pkl")
+    
+    # 7. Salvar previsões em Excel
     nome_base = arquivo.replace('.xlsx', '')
-    df_previsoes.to_excel(os.path.join(pasta, f'{nome_base}_previsoes_proximo_ano.xlsx'), index=False)
-    resumo_mensal.to_excel(os.path.join(pasta, f'{nome_base}_resumo_mensal.xlsx'))
     
-    # Salvar relatório de métricas
-    with open(os.path.join(pasta, f'{nome_base}_metricas.txt'), 'w', encoding='utf-8') as f:
-        f.write("=" * 50 + "\n")
-        f.write("📊 RELATÓRIO DE MÉTRICAS DO MODELO\n")
-        f.write("=" * 50 + "\n\n")
+    with pd.ExcelWriter(os.path.join(pasta, f'{nome_base}_previsoes_12meses.xlsx')) as writer:
+        resumo_mensal_receitas.to_excel(writer, sheet_name='Receitas_Mensal', index=False)
+        resumo_mensal_despesas.to_excel(writer, sheet_name='Despesas_Mensal', index=False)
+        
+        # Criar resumo comparativo
+        resumo_comparativo = pd.DataFrame({
+            'Mês': resumo_mensal_receitas['Mês_Nome'],
+            'Receitas': resumo_mensal_receitas['Total_Previsto'],
+            'Despesas': resumo_mensal_despesas['Total_Previsto'],
+            'Saldo_Mensal': resumo_mensal_receitas['Total_Previsto'].values - resumo_mensal_despesas['Total_Previsto'].values
+        })
+        resumo_comparativo['Saldo_Acumulado'] = resumo_comparativo['Saldo_Mensal'].cumsum()
+        resumo_comparativo.to_excel(writer, sheet_name='Resumo_Comparativo', index=False)
+        
+        # Previsões diárias
+        df_previsao_receitas.to_excel(writer, sheet_name='Receitas_Diarias', index=False)
+        df_previsao_despesas.to_excel(writer, sheet_name='Despesas_Diarias', index=False)
+    
+    print(f"   ✅ {nome_base}_previsoes_12meses.xlsx")
+    
+    # 8. Salvar relatório de métricas
+    with open(os.path.join(pasta, f'{nome_base}_metricas_modelos.txt'), 'w', encoding='utf-8') as f:
+        f.write("=" * 60 + "\n")
+        f.write("📊 RELATÓRIO DE MÉTRICAS DOS MODELOS\n")
+        f.write("=" * 60 + "\n\n")
         
         f.write(f"Arquivo analisado: {arquivo}\n")
-        f.write(f"Melhor modelo: {nome_melhor}\n\n")
+        f.write(f"Data da análise: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n")
         
-        f.write("Métricas de Treino:\n")
-        f.write(f"  RMSE: R$ {resultados[nome_melhor]['train_rmse']:.2f}\n")
-        f.write(f"  R²:   {resultados[nome_melhor]['train_r2']:.4f}\n")
-        f.write(f"  MAPE: {resultados[nome_melhor]['train_mape']:.2f}%\n\n")
+        f.write("=" * 50 + "\n")
+        f.write("MODELO DE RECEITAS\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Melhor modelo: {nome_rec}\n")
+        f.write(f"RMSE Teste: R$ {resultados_rec[nome_rec]['rmse_test']:.2f}\n")
+        f.write(f"R² Teste: {resultados_rec[nome_rec]['r2_test']:.4f}\n\n")
         
-        f.write("Métricas de Teste:\n")
-        f.write(f"  RMSE: R$ {resultados[nome_melhor]['test_rmse']:.2f}\n")
-        f.write(f"  R²:   {resultados[nome_melhor]['test_r2']:.4f}\n")
-        f.write(f"  MAPE: {resultados[nome_melhor]['test_mape']:.2f}%\n\n")
+        f.write("=" * 50 + "\n")
+        f.write("MODELO DE DESPESAS\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Melhor modelo: {nome_desp}\n")
+        f.write(f"RMSE Teste: R$ {resultados_desp[nome_desp]['rmse_test']:.2f}\n")
+        f.write(f"R² Teste: {resultados_desp[nome_desp]['r2_test']:.4f}\n\n")
         
-        f.write("Métricas de Validação:\n")
-        f.write(f"  RMSE: R$ {metricas_val['rmse']:.2f}\n")
-        f.write(f"  MAE:  R$ {metricas_val['mae']:.2f}\n")
-        f.write(f"  R²:   {metricas_val['r2']:.4f}\n")
-        f.write(f"  MAPE: {metricas_val['mape']:.2f}%\n\n")
-        
-        f.write("Previsão para o próximo ano:\n")
-        f.write(f"  Total: R$ {df_previsoes['Receita_Prevista'].sum():,.2f}\n")
-        f.write(f"  Média mensal: R$ {df_previsoes.groupby('mes')['Receita_Prevista'].sum().mean():,.2f}\n")
+        f.write("=" * 50 + "\n")
+        f.write("PREVISÕES PARA 12 MESES\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total Receitas: R$ {resumo_mensal_receitas['Total_Previsto'].sum():,.2f}\n")
+        f.write(f"Total Despesas: R$ {resumo_mensal_despesas['Total_Previsto'].sum():,.2f}\n")
+        f.write(f"Saldo Total: R$ {(resumo_mensal_receitas['Total_Previsto'].sum() - resumo_mensal_despesas['Total_Previsto'].sum()):,.2f}\n")
     
-    # 10. Plotar previsão final
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+    print(f"   ✅ {nome_base}_metricas_modelos.txt")
     
-    # Gráfico 1: Série histórica + previsão
-    ax1.plot(df_diario['Data'], df_diario['receita_total'], 'b-', label='Histórico', linewidth=1.5, alpha=0.7)
-    ax1.plot(df_previsoes['Data'], df_previsoes['Receita_Prevista'], 'r--', label='Previsão', linewidth=2)
-    ax1.axvline(x=df_diario['Data'].max(), color='green', linestyle=':', label='Hoje')
-    ax1.set_title(f'Previsão de Receitas - {nome_melhor}', fontsize=14, fontweight='bold')
-    ax1.set_xlabel('Data')
-    ax1.set_ylabel('Receita Diária (R$)')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    # 9. Gerar gráficos
+    print("\n📊 Gerando gráficos...")
     
-    # Gráfico 2: Previsão acumulada
-    ax2.fill_between(df_previsoes['Data'], 0, df_previsoes['Receita_Acumulada'], alpha=0.3, color='green')
-    ax2.plot(df_previsoes['Data'], df_previsoes['Receita_Acumulada'], 'g-', linewidth=2)
-    ax2.set_title('Receita Acumulada Prevista', fontsize=14, fontweight='bold')
-    ax2.set_xlabel('Data')
-    ax2.set_ylabel('Receita Acumulada (R$)')
-    ax2.grid(True, alpha=0.3)
+    fig = plotar_resultados(df_diario_receitas, df_diario_despesas,
+                            df_previsao_receitas, df_previsao_despesas,
+                            resumo_mensal_receitas, resumo_mensal_despesas)
     
-    plt.tight_layout()
-    plt.savefig(os.path.join(pasta, f'{nome_base}_previsao_completa.png'), dpi=100, bbox_inches='tight')
-    plt.show()
+    if fig is not None:
+        plt.savefig(os.path.join(pasta, f'{nome_base}_previsao_completa.png'), 
+                    dpi=150, bbox_inches='tight')
+        plt.show()
+        print(f"   ✅ {nome_base}_previsao_completa.png")
+    else:
+        print("   ⚠️ Não foi possível gerar o gráfico")
     
-    print("\n" + "=" * 50)
+    # 10. Imprimir resumo final
+    print("\n" + "=" * 60)
     print("✅ PROCESSO CONCLUÍDO COM SUCESSO!")
-    print("=" * 50)
+    print("=" * 60)
     print(f"\n📁 Arquivos salvos em: {pasta}")
+    print(f"\n📈 RESULTADOS DAS PREVISÕES (12 MESES):")
+    print(f"   Receitas totais:  R$ {resumo_mensal_receitas['Total_Previsto'].sum():,.2f}")
+    print(f"   Despesas totais:  R$ {resumo_mensal_despesas['Total_Previsto'].sum():,.2f}")
+    print(f"   Saldo total:      R$ {(resumo_mensal_receitas['Total_Previsto'].sum() - resumo_mensal_despesas['Total_Previsto'].sum()):,.2f}")
+    print(f"\n   Média mensal:")
+    print(f"   Receitas: R$ {resumo_mensal_receitas['Total_Previsto'].mean():,.2f}")
+    print(f"   Despesas: R$ {resumo_mensal_despesas['Total_Previsto'].mean():,.2f}")
+    
+    print(f"\n📁 Arquivos gerados:")
     print(f"   - modelo_previsao_receitas.pkl")
-    print(f"   - scaler.pkl")
-    print(f"   - {nome_base}_previsoes_proximo_ano.xlsx")
-    print(f"   - {nome_base}_resumo_mensal.xlsx")
-    print(f"   - {nome_base}_metricas.txt")
+    print(f"   - scaler_receitas.pkl")
+    print(f"   - modelo_previsao_despesas.pkl")
+    print(f"   - scaler_despesas.pkl")
+    print(f"   - {nome_base}_previsoes_12meses.xlsx")
+    print(f"   - {nome_base}_metricas_modelos.txt")
     print(f"   - {nome_base}_previsao_completa.png")
-    print(f"   - validacao_modelo.png")
-    print(f"   - importancia_features.png")
+
 
 if __name__ == "__main__":
     main()
